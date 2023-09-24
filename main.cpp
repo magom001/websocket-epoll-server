@@ -12,8 +12,41 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "picohttpparser.h"
+#include <string>
+#include "crypto.h"
+#include "base64.h"
+#include "websocket_utility.h"
 
 const int MAX_EVENTS = 64;
+
+class BaseState
+{
+public:
+    BaseState(int fd)
+    {
+        this->_fd = fd;
+    }
+
+    void set_is_websocket()
+    {
+        this->_is_websocket = true;
+    }
+
+    bool get_is_websocket()
+    {
+        return this->_is_websocket;
+    }
+
+    int get_fd() const
+    {
+        return this->_fd;
+    }
+
+private:
+    int _fd;
+    bool _is_websocket = false;
+};
 
 inline int set_nonblocking(int fd)
 {
@@ -31,6 +64,34 @@ inline int set_nonblocking(int fd)
 
         perror("fcntl F_SETFL error\n");
         return -1;
+    }
+
+    return 0;
+}
+
+int upgrade_connection(int fd, const phr_header *headers, size_t num_headers)
+{
+    bool is_upgrade = false;
+    std::string sec_websocket_key;
+    for (int i = 0; i < num_headers; ++i)
+    {
+        auto header = headers[i];
+
+        if (strncasecmp(header.name, "connection", header.name_len) == 0)
+        {
+            is_upgrade = strncasecmp(header.value, "upgrade", header.value_len) == 0;
+        }
+        else if (strncasecmp(header.name, "sec-websocket-key", header.name_len) == 0)
+        {
+            sec_websocket_key = std::string(header.value, header.value_len);
+        }
+    }
+
+    if (is_upgrade)
+    {
+        auto sec_websocket_accept_value = get_sec_websocket_accept_value(sec_websocket_key);
+        std::string response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + sec_websocket_accept_value + "\r\nUpgrade: websocket\r\n\r\n";
+        send(fd, response.data(), response.size(), 0);
     }
 
     return 0;
@@ -127,7 +188,7 @@ int main(int, char **)
                         continue;
                     }
 
-                    event.data.fd = cfd;
+                    event.data.ptr = new BaseState(cfd);
                     event.events = EPOLLIN | EPOLLET;
                     epoll_ctl(ep_fd, EPOLL_CTL_ADD, cfd, &event);
                 }
@@ -136,12 +197,12 @@ int main(int, char **)
             {
                 std::vector<char> data;
                 data.reserve(1024);
+                BaseState *state = reinterpret_cast<BaseState *>(events[i].data.ptr);
                 while (true)
                 {
                     ssize_t count;
                     char buf[1024];
-
-                    count = read(events[i].data.fd, buf, sizeof(buf));
+                    count = read(state->get_fd(), buf, sizeof(buf));
 
                     if (count == -1 && errno == EAGAIN)
                     {
@@ -151,14 +212,42 @@ int main(int, char **)
                     else if (count == 0)
                     {
                         printf("Connection closed\n");
-                        close(events[i].data.fd);
+                        close(state->get_fd());
+                        free(state);
                         break;
                     }
 
                     data.insert(data.end(), buf, buf + count);
                 }
 
-                printf("Data received: %s\n", data.data());
+                if (state->get_is_websocket())
+                {
+                    // TODO parse websocket frames
+                    parse_websocket_frame(data.data(), data.size());
+                }
+                else if (!data.empty())
+                {
+                    printf("Data received: %s\n", data.data());
+                    const char *method, *path;
+                    size_t method_len, path_len, num_headers;
+                    int minor_version;
+                    struct phr_header headers[100];
+                    num_headers = 100;
+
+                    phr_parse_request(data.data(), data.size(), &method, &method_len, &path, &path_len, &minor_version, headers, &num_headers, 0);
+
+                    if (strncmp(path, "/", path_len) == 0)
+                    {
+                        printf("Got request '/'\n");
+                        std::string response = "HTTP/1.1 204 No Content\r\n\r\n";
+                        send(state->get_fd(), response.data(), response.size(), 0);
+                    }
+                    else if (strncmp(path, "/ws", path_len) == 0)
+                    {
+                        upgrade_connection(state->get_fd(), headers, num_headers);
+                        state->set_is_websocket();
+                    }
+                }
             }
         }
     }
